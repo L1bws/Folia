@@ -1,15 +1,63 @@
 name: Patch and Build
-
 on:
   push:
     branches: [ "**" ]
   pull_request:
-
+  workflow_dispatch:
+    inputs:
+      all:
+        description: 'Build all artifacts'
+        type: boolean
+        default: false
+      mojmapBundler:
+        description: 'Build MojmapBundler'
+        type: boolean
+        default: false
+      mojmapPaperclip:
+        description: 'Build MojmapPaperclip'
+        type: boolean
+        default: false
+      reobfBundler:
+        description: 'Build ReobfBundler'
+        type: boolean
+        default: false
+      reobfPaperclip:
+        description: 'Build ReobfPaperclip'
+        type: boolean
+        default: false
 jobs:
-  build:
-    # Only run on PRs if the source branch is on someone else's repo
-    if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
+  # Generate release tag based on date for auto builds
+  prepare-release:
+    if: ${{ (github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name) && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.set-tag.outputs.release_tag }}
+    steps:
+      - name: Set Release Tag
+        id: set-tag
+        run: echo "release_tag=$(date +'%Y/%m/%d')" >> $GITHUB_OUTPUT
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.set-tag.outputs.release_tag }}
+          name: Release ${{ steps.set-tag.outputs.release_tag }}
+          prerelease: true
+          body: "## SHA256 Checksums"
+          
+  # Auto-build triggered by push or pull request
+  auto-build:
+    needs: prepare-release
+    if: ${{ (github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name) && github.event_name != 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        build_type: [
+          {name: "mojmapBundler", task: "createMojmapBundlerJar"},
+          {name: "mojmapPaperclip", task: "createMojmapPaperclipJar"},
+          {name: "reobfBundler", task: "createReobfBundlerJar"},
+          {name: "reobfPaperclip", task: "createReobfPaperclipJar"}
+        ]
+      fail-fast: false
     steps:
       - name: Checkout Git Repository
         uses: actions/checkout@v4
@@ -26,5 +74,136 @@ jobs:
         run: git config --global user.email "actions@github.com" && git config --global user.name "Github Actions"
       - name: Apply Patches
         run: ./gradlew applyPatches
-      - name: Build
-        run: ./gradlew build
+      - name: Build ${{ matrix.build_type.name }}
+        run: ./gradlew ${{ matrix.build_type.task }}
+      - name: Compress Artifacts
+        run: |
+          cd build/libs
+          zip -9 -r ${{ matrix.build_type.name }}.zip *.jar
+          echo "SHA256_HASH=$(sha256sum ${{ matrix.build_type.name }}.zip | awk '{print $1}')" >> $GITHUB_ENV
+      - name: Upload Build Artifacts
+        uses: softprops/action-gh-release@v1
+        with:
+          files: build/libs/${{ matrix.build_type.name }}.zip
+          prerelease: true
+          tag_name: ${{ needs.prepare-release.outputs.release_tag }}
+      - name: Add SHA256 to Release Notes
+        run: |
+          # Get current release body
+          RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ needs.prepare-release.outputs.release_tag }}" | \
+            jq -r .id)
+          
+          CURRENT_BODY=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID" | \
+            jq -r .body)
+          
+          # Append new hash
+          NEW_BODY="${CURRENT_BODY}
+          **${{ matrix.build_type.name }}.zip**: \`${{ env.SHA256_HASH }}\`"
+          
+          # Update release body
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID" \
+            -d "{\"body\": $(echo "$NEW_BODY" | jq -Rs .)}"
+
+  # Manual build - All artifacts
+  manual-build-all:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.all == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        build_type: [
+          {name: "mojmapBundler", task: "createMojmapBundlerJar"},
+          {name: "mojmapPaperclip", task: "createMojmapPaperclipJar"},
+          {name: "reobfBundler", task: "createReobfBundlerJar"},
+          {name: "reobfPaperclip", task: "createReobfPaperclipJar"}
+        ]
+      fail-fast: false
+    steps:
+      - name: Checkout Git Repository
+        uses: actions/checkout@v4
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Configure Git User Details
+        run: git config --global user.email "actions@github.com" && git config --global user.name "Github Actions"
+      - name: Apply Patches
+        run: ./gradlew applyPatches
+      - name: Build ${{ matrix.build_type.name }}
+        run: ./gradlew ${{ matrix.build_type.task }}
+      - name: Compress Artifacts
+        run: |
+          cd build/libs
+          zip -9 -r ${{ matrix.build_type.name }}.zip *.jar
+      - name: Upload Build Artifacts to Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.build_type.name }}
+          path: build/libs/${{ matrix.build_type.name }}.zip
+          
+  # Manual build - Individual artifacts
+  manual-build-individual:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.all != 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        build_type: [
+          {name: "mojmapBundler", task: "createMojmapBundlerJar", input: "mojmapBundler"},
+          {name: "mojmapPaperclip", task: "createMojmapPaperclipJar", input: "mojmapPaperclip"},
+          {name: "reobfBundler", task: "createReobfBundlerJar", input: "reobfBundler"},
+          {name: "reobfPaperclip", task: "createReobfPaperclipJar", input: "reobfPaperclip"}
+        ]
+      fail-fast: false
+    steps:
+      - name: Check if build is selected
+        id: check-build
+        run: |
+          if [[ "${{ github.event.inputs[matrix.build_type.input] }}" == "true" ]]; then
+            echo "selected=true" >> $GITHUB_OUTPUT
+          else
+            echo "selected=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Checkout Git Repository
+        if: steps.check-build.outputs.selected == 'true'
+        uses: actions/checkout@v4
+      - name: Validate Gradle wrapper
+        if: steps.check-build.outputs.selected == 'true'
+        uses: gradle/actions/wrapper-validation@v4
+      - name: Setup Gradle
+        if: steps.check-build.outputs.selected == 'true'
+        uses: gradle/actions/setup-gradle@v4
+      - name: Set up JDK
+        if: steps.check-build.outputs.selected == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+      - name: Configure Git User Details
+        if: steps.check-build.outputs.selected == 'true'
+        run: git config --global user.email "actions@github.com" && git config --global user.name "Github Actions"
+      - name: Apply Patches
+        if: steps.check-build.outputs.selected == 'true'
+        run: ./gradlew applyPatches
+      - name: Build ${{ matrix.build_type.name }}
+        if: steps.check-build.outputs.selected == 'true'
+        run: ./gradlew ${{ matrix.build_type.task }}
+      - name: Compress Artifacts
+        if: steps.check-build.outputs.selected == 'true'
+        run: |
+          cd build/libs
+          zip -9 -r ${{ matrix.build_type.name }}.zip *.jar
+      - name: Upload Build Artifacts to Actions
+        if: steps.check-build.outputs.selected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.build_type.name }}
+          path: build/libs/${{ matrix.build_type.name }}.zip
